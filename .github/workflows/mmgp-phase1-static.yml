@@ -1,9 +1,10 @@
-name: MMGP Phase 1 static checks
+name: MMGP experimental static checks
 
 on:
   push:
     branches:
       - exp/mmgp-phase1-profiler
+      - exp/mmgp-phase2a-async45
   workflow_dispatch:
 
 jobs:
@@ -16,5 +17,5 @@ jobs:
           python-version: "3.11"
       - name: Compile instrumentation sources
         run: python -m py_compile shared/utils/mmgp_profiler.py wgp.py
-      - name: Verify Phase 1 integration anchors
+      - name: Verify MMGP experimental integration anchors
         run: python scripts/test_mmgp_phase1_static.py
