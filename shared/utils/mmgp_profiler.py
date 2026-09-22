@@ -344,7 +344,7 @@ class _RuntimeProfiler:
             if manager.ready_to_check_mem():
                 manager.empty_cache_if_needed()
 
-        torch.cuda.current_stream(device=ready_event.device).wait_event(ready_event)
+        torch.cuda.current_stream().wait_event(ready_event)
         manager.loaded_blocks[model_id] = blocks_name
         consumed_ns = time.perf_counter_ns()
         record = {
