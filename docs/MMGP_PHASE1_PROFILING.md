@@ -57,6 +57,8 @@ The JSON contains:
 - MMGP's detected residency plan and per-block weight sizes;
 - per-root-block CPU-forward wall time;
 - per-root-block CUDA-event compute timing where available;
+- callback-based per-denoising-step wall timing and callback overhead;
+- MMGP `profile(...)` setup time, kept separate from `model.generate(...)` time;
 - every observed `gpu_load_blocks` call, addressed bytes, current/next block,
   async state, residency state and load-path wall time;
 - duration/count of `torch.cuda.synchronize()` calls while inside an MMGP
@@ -77,9 +79,11 @@ loop.
    can provide direct copy-engine timing.
 3. CUDA root-block timing measures current-stream work. Model-specific auxiliary
    streams may not be fully represented.
-4. VRAM peaks are sampled at profiler observation points, so the true
+4. Denoising-step timing is callback-based: it measures from the previous
+   callback return to the next step callback entry, not pure GPU-kernel time.
+5. VRAM peaks are sampled at profiler observation points, so the true
    instantaneous peak may be somewhat higher.
-5. Profiling has overhead. Compare candidate implementations with the same
+6. Profiling has overhead. Compare candidate implementations with the same
    profiler state, then confirm any final speedup again with profiling disabled.
 
 These limitations are also embedded in every JSON profile.
