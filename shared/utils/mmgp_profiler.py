@@ -44,6 +44,11 @@ def enabled() -> bool:
     return _env_bool(_ENV_ENABLE, False)
 
 
+def active() -> bool:
+    """Return True only after the opt-in profiler hooks were installed."""
+    return _RUNTIME is not None
+
+
 def hash_text(value: Any) -> str | None:
     """Hash reproducibility text without writing the original prompt."""
     if value is None:
@@ -746,4 +751,4 @@ def wrap_callback(token: str | None, callback):
     return wrapped
 
 
-__all__ = ["enabled", "finish_generation", "hash_text", "install", "start_generation", "wrap_callback"]
+__all__ = ["active", "enabled", "finish_generation", "hash_text", "install", "start_generation", "wrap_callback"]
