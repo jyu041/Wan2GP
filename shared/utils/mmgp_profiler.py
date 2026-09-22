@@ -31,6 +31,7 @@ _ENV_ENABLE = "WAN2GP_MMGP_PROFILE"
 _ENV_DIR = "WAN2GP_MMGP_PROFILE_DIR"
 _ENV_PRINT = "WAN2GP_MMGP_PROFILE_PRINT"
 _ENV_MAX_RECORDS = "WAN2GP_MMGP_PROFILE_MAX_RECORDS"
+_ENV_THREADED_PREFETCH = "WAN2GP_MMGP_EXPERIMENT_THREADED_PREFETCH"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -105,6 +106,10 @@ class _RuntimeProfiler:
         self.load_records: list[dict[str, Any]] = []
         self.sync_records: list[dict[str, Any]] = []
         self.step_records: list[dict[str, Any]] = []
+        self.prefetch_records: list[dict[str, Any]] = []
+        self.prefetch_enabled = _env_bool(_ENV_THREADED_PREFETCH, False)
+        self.prefetch_lock = threading.RLock()
+        self.prefetch_states: dict[tuple[int, str], dict[str, Any]] = {}
         self._exported_sessions: set[str] = set()
         self._closed = False
 
@@ -170,6 +175,7 @@ class _RuntimeProfiler:
             }
         return {
             "async_transfers": bool(getattr(manager, "async_transfers", False)),
+            "experimental_threaded_prefetch": bool(self.prefetch_enabled),
             "device_mem_capacity": int(getattr(manager, "device_mem_capacity", 0) or 0),
             "models": models,
         }
@@ -182,6 +188,203 @@ class _RuntimeProfiler:
                 "profile_setup_ms": profile_setup_ms,
                 "plan": self._manager_plan(manager),
             }
+
+    @staticmethod
+    def _is_threaded_prefetch_target(model_id: str, blocks_name: str | None) -> bool:
+        if model_id != "transformer" or not isinstance(blocks_name, str):
+            return False
+        if not blocks_name.startswith("blocks."):
+            return False
+        suffix = blocks_name[len("blocks."):]
+        return suffix.isdigit()
+
+    def _prefetch_state_key(self, manager, model_id: str):
+        return (id(manager), str(model_id))
+
+    def _restore_prefetched_block(self, manager, model_id: str, blocks_name: str) -> None:
+        entry_name = self._block_entry(model_id, blocks_name)
+        blocks_params = (getattr(manager, "blocks_of_modules", {}) or {}).get(entry_name)
+        if not blocks_params:
+            return
+        model = manager.models[model_id]
+        loras_modules = {}
+        loras_active_adapters = getattr(model, "_loras_active_adapters", None)
+        loras_model_data = getattr(model, "_loras_model_data", None) if loras_active_adapters else None
+        for parent_module, name, cpu_value, is_buffer, _ in blocks_params:
+            if is_buffer:
+                restored = self.offload_module._make_buffer(cpu_value)
+            else:
+                restored = self.offload_module._make_parameter(cpu_value, requires_grad=False)
+            setattr(parent_module, name, restored)
+            if loras_model_data is not None:
+                lora_data = loras_model_data.get(parent_module, None)
+                if lora_data is not None:
+                    loras_modules[parent_module] = lora_data
+        if loras_modules:
+            manager._move_loras(loras_active_adapters, loras_modules, False, model)
+
+    def _threaded_prefetch_worker(self, state, manager, model_id: str, blocks_name: str) -> None:
+        started_ns = time.perf_counter_ns()
+        state["worker_started_ns"] = started_ns
+        state["memory_before"] = self._memory_sample()
+        try:
+            entry_name = self._block_entry(model_id, blocks_name)
+            blocks_params = manager.blocks_of_modules[entry_name]
+            model = manager.models[model_id]
+            loras_modules = {}
+            loras_active_adapters = getattr(model, "_loras_active_adapters", None)
+            loras_model_data = getattr(model, "_loras_model_data", None) if loras_active_adapters else None
+            device = manager.transfer_stream.device
+            with torch.cuda.device(device), torch.cuda.stream(manager.transfer_stream):
+                for parent_module, name, cpu_value, is_buffer, tied_param in blocks_params:
+                    if tied_param is not None:
+                        tied_value = getattr(tied_param[0], tied_param[1])
+                        if tied_value.is_cuda:
+                            setattr(parent_module, name, tied_value)
+                            continue
+                    gpu_value = cpu_value.to(device, non_blocking=True)
+                    if is_buffer:
+                        gpu_value = self.offload_module._make_buffer(gpu_value)
+                    else:
+                        gpu_value = self.offload_module._make_parameter(gpu_value, requires_grad=False)
+                    setattr(parent_module, name, gpu_value)
+                    if tied_param is not None:
+                        setattr(tied_param[0], tied_param[1], gpu_value)
+                    if loras_model_data is not None:
+                        lora_data = loras_model_data.get(parent_module, None)
+                        if lora_data is not None:
+                            loras_modules[parent_module] = lora_data
+                if loras_modules:
+                    manager._move_loras(loras_active_adapters, loras_modules, True, model)
+                ready_event = torch.cuda.Event()
+                ready_event.record(manager.transfer_stream)
+            state["ready_event"] = ready_event
+        except BaseException as exc:
+            state["error"] = exc
+        finally:
+            ended_ns = time.perf_counter_ns()
+            state["worker_ended_ns"] = ended_ns
+            state["host_prepare_ms"] = (ended_ns - started_ns) / 1_000_000.0
+            state["memory_after_prepare"] = self._memory_sample()
+
+    def start_threaded_prefetch(self, manager, model_id: str, blocks_name: str | None) -> None:
+        if not self.prefetch_enabled or not self._is_threaded_prefetch_target(str(model_id), blocks_name):
+            return
+        if bool(getattr(manager, "async_transfers", False)):
+            return
+        entry_name = self._block_entry(str(model_id), blocks_name)
+        next_entry = (getattr(manager, "next_blocks_names", {}) or {}).get(entry_name)
+        if not isinstance(next_entry, str):
+            return
+        prefix = f"{model_id}/"
+        if not next_entry.startswith(prefix):
+            return
+        next_block = next_entry[len(prefix):]
+        if not self._is_threaded_prefetch_target(str(model_id), next_block):
+            return
+        if next_block in (getattr(manager, "preloaded_blocks_per_model", {}) or {}).get(model_id, []):
+            return
+
+        key = self._prefetch_state_key(manager, str(model_id))
+        with self.prefetch_lock:
+            existing = self.prefetch_states.get(key)
+            if existing is not None:
+                return
+            state = {
+                "generation_id": self.current_generation_id(),
+                "manager_id": id(manager),
+                "model_id": str(model_id),
+                "source_block": blocks_name,
+                "block_name": next_block,
+                "entry_name": next_entry,
+                "bytes": int((getattr(manager, "blocks_of_modules_sizes", {}) or {}).get(next_entry, 0) or 0),
+                "created_ns": time.perf_counter_ns(),
+                "error": None,
+                "ready_event": None,
+            }
+            thread = threading.Thread(
+                target=self._threaded_prefetch_worker,
+                args=(state, manager, str(model_id), next_block),
+                name=f"mmgp-prefetch-{next_block}",
+                daemon=True,
+            )
+            state["thread"] = thread
+            self.prefetch_states[key] = state
+            thread.start()
+
+    def consume_threaded_prefetch(self, manager, model_id, blocks_name, preload=False) -> bool:
+        if not self.prefetch_enabled or preload:
+            return False
+        model_key = str(model_id)
+        if not self._is_threaded_prefetch_target(model_key, blocks_name):
+            return False
+        key = self._prefetch_state_key(manager, model_key)
+        with self.prefetch_lock:
+            state = self.prefetch_states.get(key)
+        if state is None or state.get("block_name") != blocks_name:
+            return False
+
+        wait_started_ns = time.perf_counter_ns()
+        state["thread"].join()
+        join_ended_ns = time.perf_counter_ns()
+        error = state.get("error")
+        if error is not None:
+            with self.prefetch_lock:
+                self.prefetch_states.pop(key, None)
+            raise error
+        ready_event = state.get("ready_event")
+        if ready_event is None:
+            with self.prefetch_lock:
+                self.prefetch_states.pop(key, None)
+            return False
+
+        loaded_block = (getattr(manager, "loaded_blocks", {}) or {}).get(model_id)
+        if loaded_block is not None and loaded_block != blocks_name:
+            manager.gpu_unload_blocks(model_id, loaded_block)
+            if manager.ready_to_check_mem():
+                manager.empty_cache_if_needed()
+
+        torch.cuda.current_stream(device=ready_event.device).wait_event(ready_event)
+        manager.loaded_blocks[model_id] = blocks_name
+        consumed_ns = time.perf_counter_ns()
+        record = {
+            "generation_id": state.get("generation_id"),
+            "manager_id": id(manager),
+            "model_id": model_key,
+            "source_block": state.get("source_block"),
+            "block_name": blocks_name,
+            "entry_name": state.get("entry_name"),
+            "bytes": state.get("bytes", 0),
+            "host_prepare_ms": state.get("host_prepare_ms"),
+            "join_wait_ms": (join_ended_ns - wait_started_ns) / 1_000_000.0,
+            "adopt_wall_ms": (consumed_ns - wait_started_ns) / 1_000_000.0,
+            "memory_before": state.get("memory_before"),
+            "memory_after_prepare": state.get("memory_after_prepare"),
+            "memory_after_adopt": self._memory_sample(),
+        }
+        with self.lock:
+            if len(self.prefetch_records) < self.max_records:
+                self.prefetch_records.append(_json_safe(record))
+        with self.prefetch_lock:
+            self.prefetch_states.pop(key, None)
+        return True
+
+    def drain_threaded_prefetch(self, manager) -> None:
+        if not self.prefetch_enabled:
+            return
+        manager_id = id(manager)
+        with self.prefetch_lock:
+            states = [(key, state) for key, state in self.prefetch_states.items() if key[0] == manager_id]
+        for key, state in states:
+            try:
+                state["thread"].join()
+                if state.get("error") is None:
+                    self._restore_prefetched_block(
+                        manager, state["model_id"], state["block_name"]
+                    )
+            finally:
+                with self.prefetch_lock:
+                    self.prefetch_states.pop(key, None)
 
     def start_generation(self, manager, metadata: dict[str, Any] | None) -> str:
         generation_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
@@ -268,6 +471,7 @@ class _RuntimeProfiler:
         generation_id = self.current_generation_id()
         if generation_id is None:
             return None
+        self.start_threaded_prefetch(manager, str(model_id), str(blocks_name))
         token = {
             "generation_id": generation_id,
             "manager_id": id(manager),
@@ -492,6 +696,7 @@ class _RuntimeProfiler:
             loads = self._records_for(self.load_records, generation_id)
             syncs = self._records_for(self.sync_records, generation_id)
             steps = self._records_for(self.step_records, generation_id)
+            prefetches = self._records_for(self.prefetch_records, generation_id)
             aggregate = self._aggregate_blocks(generation_id)
             manager_info = self.managers.get(gen.get("manager_id"), {})
             pinned_bytes = int(getattr(self.offload_module, "total_pinned_bytes", 0) or 0)
@@ -511,6 +716,9 @@ class _RuntimeProfiler:
                 "denoising_step_callbacks": len(steps),
                 "denoising_step_wall_ms": sum(float(r.get("step_wall_before_callback_ms") or 0) for r in steps),
                 "callback_overhead_ms": sum(float(r.get("callback_overhead_ms") or 0) for r in steps),
+                "experimental_prefetch_calls": len(prefetches),
+                "experimental_prefetch_host_prepare_ms": sum(float(r.get("host_prepare_ms") or 0) for r in prefetches),
+                "experimental_prefetch_join_wait_ms": sum(float(r.get("join_wait_ms") or 0) for r in prefetches),
                 "observed_peak_allocated_bytes": gen["observed_peak_allocated_bytes"],
                 "observed_peak_reserved_bytes": gen["observed_peak_reserved_bytes"],
                 "mmgp_total_pinned_bytes_at_export": pinned_bytes,
@@ -522,6 +730,7 @@ class _RuntimeProfiler:
                     "CUDA block timing covers the current stream; auxiliary-stream work may not be fully represented.",
                     "Observed VRAM peaks are sampled and can be below the true instantaneous peak.",
                     "Denoising step wall time is callback-based: it measures time from the previous callback return to the next step callback entry and is not a pure GPU-kernel duration.",
+                    "Experimental threaded-prefetch host_prepare_ms measures background host preparation/enqueue time; it is not pure H2D DMA time.",
                 ],
             }
             payload = {
@@ -535,6 +744,7 @@ class _RuntimeProfiler:
                 "load_records": _json_safe(loads),
                 "sync_records": _json_safe(syncs),
                 "step_records": _json_safe(steps),
+                "prefetch_records": _json_safe(prefetches),
             }
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -573,6 +783,7 @@ class _RuntimeProfiler:
             f"  MMGP load-path wall time: {(summary['gpu_load_path_wall_ms'] or 0)/1000.0:.3f} s",
             f"  MMGP-attributed cuda.synchronize: {summary['mmgp_sync_calls']} calls / {sync_s:.3f} s",
             f"  denoising callback steps: {summary['denoising_step_callbacks']} / {(summary['denoising_step_wall_ms'] or 0)/1000.0:.3f} s",
+            f"  threaded prefetch: {summary['experimental_prefetch_calls']} adopts / {(summary['experimental_prefetch_join_wait_ms'] or 0)/1000.0:.3f} s host wait",
             f"  observed reserved-VRAM peak: {peak_vram:.3f} GiB",
             f"  MMGP pinned RAM at export: {pinned:.3f} GiB",
             f"  pending CUDA event timings: {summary['pending_gpu_compute_events']}",
@@ -662,12 +873,15 @@ def install(offload_module) -> bool:
         def gpu_load_blocks_wrapper(manager, model_id, blocks_name, preload=False):
             context = runtime.before_gpu_load(manager, model_id, blocks_name, preload)
             try:
+                if runtime.consume_threaded_prefetch(manager, model_id, blocks_name, preload=preload):
+                    return None
                 return original_gpu_load_blocks(manager, model_id, blocks_name, preload)
             finally:
                 runtime.after_gpu_load(context, manager)
 
         @functools.wraps(original_unload_all)
         def unload_all_wrapper(manager, *args, **kwargs):
+            runtime.drain_threaded_prefetch(manager)
             previous = runtime._set_mmgp_context({
                 "kind": "unload_all",
                 "generation_id": runtime.current_generation_id(),
@@ -710,6 +924,8 @@ def install(offload_module) -> bool:
         _RUNTIME = runtime
         atexit.register(runtime.close)
         print(f"[MMGP profiler] Phase 1 enabled. Output directory: {runtime.output_dir}")
+        if runtime.prefetch_enabled:
+            print("[MMGP experiment] Phase 2B threaded next-block prefetch enabled")
         return True
 
 
