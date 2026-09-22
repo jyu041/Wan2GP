@@ -3923,7 +3923,10 @@ def init_pipe(pipe, kwargs, profile):
             kwargs["pinnedMemory"] = ["transformer", "transformer2"]
     
     if profile == 4.5:
-        kwargs["asyncTransfers"] = False
+        _mmgp_exp_async45 = os.getenv("WAN2GP_MMGP_EXPERIMENT_ASYNC45", "").strip().lower() in ("1", "true", "yes", "on", "y")
+        kwargs["asyncTransfers"] = _mmgp_exp_async45
+        if _mmgp_exp_async45:
+            print("[MMGP experiment] Phase 2A: enabling MMGP asyncTransfers for profile 4.5")
     elif profile == 3.5:
         kwargs["pinnedMemory"] = False
     if is_mps:
