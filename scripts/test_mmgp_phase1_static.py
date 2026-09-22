@@ -66,7 +66,7 @@ def main() -> None:
     for marker in phase2b_markers:
         assert marker in profiler, f"missing Phase 2B marker: {marker}"
 
-    first_block_cache = (root / "models" / "minimax_h3" / "first_block_cache.py").read_text(encoding="utf-8")
+    first_block_cache = (ROOT / "models" / "minimax_h3" / "first_block_cache.py").read_text(encoding="utf-8")
     assert "Phase 2B detected a non-finite First Block Cache signature" in first_block_cache
 
     # The experimental integration must keep the upstream MMGP pin intact.
