@@ -1,0 +1,20 @@
+name: MMGP Phase 1 static checks
+
+on:
+  push:
+    branches:
+      - exp/mmgp-phase1-profiler
+  workflow_dispatch:
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile instrumentation sources
+        run: python -m py_compile shared/utils/mmgp_profiler.py wgp.py
+      - name: Verify Phase 1 integration anchors
+        run: python scripts/test_mmgp_phase1_static.py
