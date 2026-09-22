@@ -99,6 +99,7 @@ class _RuntimeProfiler:
         self.block_records: list[dict[str, Any]] = []
         self.load_records: list[dict[str, Any]] = []
         self.sync_records: list[dict[str, Any]] = []
+        self.step_records: list[dict[str, Any]] = []
         self._exported_sessions: set[str] = set()
         self._closed = False
 
@@ -168,11 +169,12 @@ class _RuntimeProfiler:
             "models": models,
         }
 
-    def attach_manager(self, manager) -> None:
+    def attach_manager(self, manager, profile_setup_ms: float | None = None) -> None:
         with self.lock:
             self.managers[id(manager)] = {
                 "manager": manager,
                 "attached_at": _utc_now(),
+                "profile_setup_ms": profile_setup_ms,
                 "plan": self._manager_plan(manager),
             }
 
@@ -198,6 +200,7 @@ class _RuntimeProfiler:
                 "memory_end": None,
                 "observed_peak_allocated_bytes": 0,
                 "observed_peak_reserved_bytes": 0,
+                "last_step_callback_exit_ns": now_ns,
             }
         self._set_generation_id(generation_id)
         return generation_id
@@ -218,6 +221,43 @@ class _RuntimeProfiler:
             self._resolve_cuda_events()
         if self.current_generation_id() == generation_id:
             self._set_generation_id(None)
+
+    def step_callback_enter(self, generation_id: str, args, kwargs):
+        step_idx = kwargs.get("step_idx", args[0] if args else -1)
+        try:
+            step_idx = int(step_idx)
+        except (TypeError, ValueError):
+            step_idx = -1
+        if step_idx < 0:
+            return None
+        pass_no = kwargs.get("pass_no", -1)
+        now_ns = time.perf_counter_ns()
+        with self.lock:
+            gen = self.generations.get(generation_id)
+            if gen is None:
+                return None
+            previous_exit_ns = gen.get("last_step_callback_exit_ns") or gen["start_ns"]
+        return {
+            "generation_id": generation_id,
+            "step_idx": step_idx,
+            "pass_no": _json_safe(pass_no),
+            "progress_title": _json_safe(kwargs.get("progress_title")),
+            "entry_ns": now_ns,
+            "step_wall_before_callback_ms": (now_ns - previous_exit_ns) / 1_000_000.0,
+        }
+
+    def step_callback_exit(self, token) -> None:
+        if token is None:
+            return
+        end_ns = time.perf_counter_ns()
+        token["callback_overhead_ms"] = (end_ns - token["entry_ns"]) / 1_000_000.0
+        token["exit_ns"] = end_ns
+        with self.lock:
+            gen = self.generations.get(token["generation_id"])
+            if gen is not None:
+                gen["last_step_callback_exit_ns"] = end_ns
+            if len(self.step_records) < self.max_records:
+                self.step_records.append(_json_safe(token))
 
     def block_forward_start(self, manager, model_id: str, blocks_name: str):
         generation_id = self.current_generation_id()
@@ -446,6 +486,7 @@ class _RuntimeProfiler:
             blocks = self._records_for(self.block_records, generation_id)
             loads = self._records_for(self.load_records, generation_id)
             syncs = self._records_for(self.sync_records, generation_id)
+            steps = self._records_for(self.step_records, generation_id)
             aggregate = self._aggregate_blocks(generation_id)
             manager_info = self.managers.get(gen.get("manager_id"), {})
             pinned_bytes = int(getattr(self.offload_module, "total_pinned_bytes", 0) or 0)
@@ -462,15 +503,20 @@ class _RuntimeProfiler:
                 "streamed_or_loaded_bytes": sum(int(r.get("bytes") or 0) for r in loads),
                 "mmgp_sync_calls": len(syncs),
                 "mmgp_sync_wall_ms": sum(float(r.get("duration_ms") or 0) for r in syncs),
+                "denoising_step_callbacks": len(steps),
+                "denoising_step_wall_ms": sum(float(r.get("step_wall_before_callback_ms") or 0) for r in steps),
+                "callback_overhead_ms": sum(float(r.get("callback_overhead_ms") or 0) for r in steps),
                 "observed_peak_allocated_bytes": gen["observed_peak_allocated_bytes"],
                 "observed_peak_reserved_bytes": gen["observed_peak_reserved_bytes"],
                 "mmgp_total_pinned_bytes_at_export": pinned_bytes,
+                "manager_profile_setup_ms": manager_info.get("profile_setup_ms"),
                 "manager_plan": manager_info.get("plan"),
                 "limitations": [
                     "gpu_load_path_wall_ms is MMGP load-path wall time, not pure H2D DMA time.",
                     "MMGP async hidden H2D duration cannot be isolated without tracing inside cpu_to_gpu/CUPTI; Phase 1 records bytes, synchronization waits and overlap proxies.",
                     "CUDA block timing covers the current stream; auxiliary-stream work may not be fully represented.",
                     "Observed VRAM peaks are sampled and can be below the true instantaneous peak.",
+                    "Denoising step wall time is callback-based: it measures time from the previous callback return to the next step callback entry and is not a pure GPU-kernel duration.",
                 ],
             }
             payload = {
@@ -483,6 +529,7 @@ class _RuntimeProfiler:
                 "block_records": _json_safe(blocks),
                 "load_records": _json_safe(loads),
                 "sync_records": _json_safe(syncs),
+                "step_records": _json_safe(steps),
             }
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -520,6 +567,7 @@ class _RuntimeProfiler:
             f"  MMGP gpu_load_blocks calls: {summary['gpu_load_calls']} ({loaded_gb:.3f} GB addressed)",
             f"  MMGP load-path wall time: {(summary['gpu_load_path_wall_ms'] or 0)/1000.0:.3f} s",
             f"  MMGP-attributed cuda.synchronize: {summary['mmgp_sync_calls']} calls / {sync_s:.3f} s",
+            f"  denoising callback steps: {summary['denoising_step_callbacks']} / {(summary['denoising_step_wall_ms'] or 0)/1000.0:.3f} s",
             f"  observed reserved-VRAM peak: {peak_vram:.3f} GiB",
             f"  MMGP pinned RAM at export: {pinned:.3f} GiB",
             f"  pending CUDA event timings: {summary['pending_gpu_compute_events']}",
@@ -599,8 +647,10 @@ def install(offload_module) -> bool:
 
         @functools.wraps(original_profile)
         def profile_wrapper(*args, **kwargs):
+            start_ns = time.perf_counter_ns()
             manager = original_profile(*args, **kwargs)
-            runtime.attach_manager(manager)
+            setup_ms = (time.perf_counter_ns() - start_ns) / 1_000_000.0
+            runtime.attach_manager(manager, profile_setup_ms=setup_ms)
             return manager
 
         @functools.wraps(original_gpu_load_blocks)
@@ -679,4 +729,21 @@ def finish_generation(token: str | None, *, status: str = "ok", error=None) -> N
         print(f"[MMGP profiler] Failed to finish generation profile: {exc}")
 
 
-__all__ = ["enabled", "finish_generation", "hash_text", "install", "start_generation"]
+def wrap_callback(token: str | None, callback):
+    """Wrap Wan2GP's existing callback to estimate denoising-step wall time."""
+    runtime = _RUNTIME
+    if runtime is None or token is None or callback is None:
+        return callback
+
+    @functools.wraps(callback)
+    def wrapped(*args, **kwargs):
+        step_token = runtime.step_callback_enter(token, args, kwargs)
+        try:
+            return callback(*args, **kwargs)
+        finally:
+            runtime.step_callback_exit(step_token)
+
+    return wrapped
+
+
+__all__ = ["enabled", "finish_generation", "hash_text", "install", "start_generation", "wrap_callback"]
