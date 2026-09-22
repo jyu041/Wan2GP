@@ -41,6 +41,7 @@ import warnings
 warnings.filterwarnings('ignore', message='Failed to find.*', module='triton')
 warnings.filterwarnings("ignore", message=r"Failed to launch Triton kernels, likely due to missing CUDA toolkit; falling back to a slower .* implementation\.\.\.", category=UserWarning, module=r"whisper\.timing")
 from mmgp import offload, safetensors2, profile_type , quant_router
+from shared.utils import mmgp_profiler
 try:
     import triton
 except ImportError:
@@ -198,6 +199,7 @@ mmgp_version = version("mmgp")
 if mmgp_version != target_mmgp_version:
     print(f"Incorrect version of mmgp ({mmgp_version}), version {target_mmgp_version} is needed. Please upgrade with the command 'pip install -r requirements.txt'")
     exit()
+mmgp_profiler.install(offload)
 lock = threading.Lock()
 current_task_id = None
 task_id = 0
@@ -8004,6 +8006,7 @@ def generate_media(
                 gen["header_text"] = txt
                 send_cmd("output")
 
+            _mmgp_profile_token = None
             try:
                 input_video_for_model = None if new_shot else pre_video_guide
                 input_video_is_hdr = pre_video_guide_is_hdr
@@ -8029,6 +8032,26 @@ def generate_media(
                 overridden_inputs = None
                 if vae_upsampler_handler is not None and vae_upsampler_session is None:
                     vae_upsampler_session = upsampler_api.prepare_vae_upsampler(vae_upsampler_handler, spatial_upsampling, send_cmd=send_cmd, process_files=process_files_def, init_pipe=init_pipe, profile=compute_profile(override_profile, upsampler_api.profile_type_for_handler(vae_upsampler_handler)), attention_mode=attention_mode, spatial_upsampler_param=spatial_upsampler_param, spatial_upsampler_param2=spatial_upsampler_param2, spatial_upsampler_parameters=spatial_upsampler_parameters)
+                _mmgp_profile_token = mmgp_profiler.start_generation(
+                    offloadobj,
+                    model_type=model_type,
+                    base_model_type=base_model_type,
+                    config=config,
+                    memory_profile=loaded_profile,
+                    attention_mode=attention_mode,
+                    model_filename=model_filename,
+                    prompt_sha256=mmgp_profiler.hash_text(prompt),
+                    seed=seed,
+                    height=image_size[0],
+                    width=image_size[1],
+                    frame_num=floor_frame_count(current_video_length, frames_minimum, latent_size, frames_offset),
+                    batch_size=batch_size,
+                    sampling_steps=num_inference_steps,
+                    sampler=sample_solver,
+                    window_no=window_no,
+                    repeat_no=repeat_no,
+                    fps=fps,
+                )
                 samples = wan_model.generate(
                     input_prompt = prompt,
                     alt_prompt = current_alt_prompt,
@@ -8149,9 +8172,14 @@ def generate_media(
                     vae_upsampler=vae_upsampler_session,
                     save_masks=args.save_masks,
                 )
+                mmgp_profiler.finish_generation(_mmgp_profile_token, status="ok")
+                _mmgp_profile_token = None
                 upsampler_api.release_vae_upsampler(vae_upsampler_handler, vae_upsampler_session)
                 vae_upsampler_session = None
             except Exception as e:
+                if _mmgp_profile_token is not None:
+                    mmgp_profiler.finish_generation(_mmgp_profile_token, status="error", error=e)
+                    _mmgp_profile_token = None
                 upsampler_api.release_vae_upsampler(vae_upsampler_handler, vae_upsampler_session)
                 vae_upsampler_session = None
                 if len(control_audio_tracks) > 0 or len(source_audio_tracks) > 0:
