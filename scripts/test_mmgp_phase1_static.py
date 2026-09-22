@@ -60,9 +60,14 @@ def main() -> None:
         'def consume_threaded_prefetch(',
         '[MMGP experiment] Phase 2B threaded next-block prefetch enabled',
         '"prefetch_records": _json_safe(prefetches)',
+        'experimental_prefetch_stream_lifetime_tracking',
+        'record_stream(stream)',
     )
     for marker in phase2b_markers:
         assert marker in profiler, f"missing Phase 2B marker: {marker}"
+
+    first_block_cache = (root / "models" / "minimax_h3" / "first_block_cache.py").read_text(encoding="utf-8")
+    assert "Phase 2B detected a non-finite First Block Cache signature" in first_block_cache
 
     # The experimental integration must keep the upstream MMGP pin intact.
     requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
