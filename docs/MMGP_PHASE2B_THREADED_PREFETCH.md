@@ -1,5 +1,18 @@
 # MMGP Phase 2B — threaded next-block prefetch
 
+> **2026-09-22 correction:** commit `6122f089` is invalid for benchmarking.
+> It prefetched CUDA allocations on MMGP's transfer stream and consumed them on
+> the main stream without `Tensor.record_stream()`. The first four validation
+> runs exposed silent numerical corruption: First Block Cache reported
+> `Skipped Steps:7/8`, the model emitted an invalid-value cast warning, and
+> transformer blocks 1-49 executed only once. The apparent ~45 s warm runtime
+> was therefore not a valid speedup.
+>
+> Phase 2B v2 records all prefetched block and LoRA CUDA storage on the consumer
+> stream before it can be unloaded/recycled. An experiment-only finite-signature
+> guard now aborts if First Block Cache sees non-finite values, so the failure
+> mode cannot silently turn into extra cache skipping.
+
 Phase 2A established that MMGP 3.8.1's built-in async shuttle is stable on the
 RTX 3070 profile-4.5 workload, but slower than the synchronous baseline.
 
@@ -68,7 +81,8 @@ The JSON manager plan should report:
 
 ```json
 "async_transfers": false,
-"experimental_threaded_prefetch": true
+"experimental_threaded_prefetch": true,
+"experimental_prefetch_stream_lifetime_tracking": true
 ```
 
 ## What is measured
