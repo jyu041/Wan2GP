@@ -8032,27 +8032,30 @@ def generate_media(
                 overridden_inputs = None
                 if vae_upsampler_handler is not None and vae_upsampler_session is None:
                     vae_upsampler_session = upsampler_api.prepare_vae_upsampler(vae_upsampler_handler, spatial_upsampling, send_cmd=send_cmd, process_files=process_files_def, init_pipe=init_pipe, profile=compute_profile(override_profile, upsampler_api.profile_type_for_handler(vae_upsampler_handler)), attention_mode=attention_mode, spatial_upsampler_param=spatial_upsampler_param, spatial_upsampler_param2=spatial_upsampler_param2, spatial_upsampler_parameters=spatial_upsampler_parameters)
-                _mmgp_profile_token = mmgp_profiler.start_generation(
-                    offloadobj,
-                    model_type=model_type,
-                    base_model_type=base_model_type,
-                    config=config,
-                    memory_profile=loaded_profile,
-                    attention_mode=attention_mode,
-                    model_filename=model_filename,
-                    prompt_sha256=mmgp_profiler.hash_text(prompt),
-                    seed=seed,
-                    height=image_size[0],
-                    width=image_size[1],
-                    frame_num=floor_frame_count(current_video_length, frames_minimum, latent_size, frames_offset),
-                    batch_size=batch_size,
-                    sampling_steps=num_inference_steps,
-                    sampler=sample_solver,
-                    window_no=window_no,
-                    repeat_no=repeat_no,
-                    fps=fps,
-                )
-                _mmgp_profile_callback = mmgp_profiler.wrap_callback(_mmgp_profile_token, callback)
+                if mmgp_profiler.active():
+                    _mmgp_profile_token = mmgp_profiler.start_generation(
+                        offloadobj,
+                        model_type=model_type,
+                        base_model_type=base_model_type,
+                        config=config,
+                        memory_profile=loaded_profile,
+                        attention_mode=attention_mode,
+                        model_filename=model_filename,
+                        prompt_sha256=mmgp_profiler.hash_text(prompt),
+                        seed=seed,
+                        height=image_size[0],
+                        width=image_size[1],
+                        frame_num=floor_frame_count(current_video_length, frames_minimum, latent_size, frames_offset),
+                        batch_size=batch_size,
+                        sampling_steps=num_inference_steps,
+                        sampler=sample_solver,
+                        window_no=window_no,
+                        repeat_no=repeat_no,
+                        fps=fps,
+                    )
+                    _mmgp_profile_callback = mmgp_profiler.wrap_callback(_mmgp_profile_token, callback)
+                else:
+                    _mmgp_profile_callback = callback
                 samples = wan_model.generate(
                     input_prompt = prompt,
                     alt_prompt = current_alt_prompt,
