@@ -54,11 +54,19 @@ def main() -> None:
     for marker in wgp_markers:
         assert marker in wgp, f"missing Wan2GP integration marker: {marker}"
 
+    phase2a_markers = (
+        'WAN2GP_MMGP_EXPERIMENT_ASYNC45',
+        'kwargs["asyncTransfers"] = _mmgp_exp_async45',
+        '[MMGP experiment] Phase 2A: enabling MMGP asyncTransfers for profile 4.5',
+    )
+    for marker in phase2a_markers:
+        assert marker in wgp, f"missing Phase 2A marker: {marker}"
+
     # The experimental integration must keep the upstream MMGP pin intact.
     requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
     assert "mmgp==3.8.1" in requirements
 
-    print("MMGP Phase 1 static checks passed.")
+    print("MMGP Phase 1/2A static checks passed.")
 
 
 if __name__ == "__main__":
