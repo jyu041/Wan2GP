@@ -1,5 +1,7 @@
 """Memory-conscious FirstBlockCache state for MiniMax H3."""
 
+import os
+
 import torch
 
 
@@ -21,6 +23,11 @@ class MiniMaxH3FirstBlockCache:
         self.step = step
 
     def should_compute(self, signature):
+        if os.getenv("WAN2GP_MMGP_EXPERIMENT_THREADED_PREFETCH", "").strip().lower() in {"1", "true", "yes", "on"}:
+            if not bool(torch.isfinite(signature).all().item()):
+                raise FloatingPointError(
+                    "Phase 2B detected a non-finite First Block Cache signature; aborting instead of silently skipping denoising steps."
+                )
         compute = self.step < self.start_step or self.head_signature is None or self.tail_residual is None
         if not compute:
             previous = self.head_signature
