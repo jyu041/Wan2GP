@@ -54,11 +54,21 @@ def main() -> None:
     for marker in wgp_markers:
         assert marker in wgp, f"missing Wan2GP integration marker: {marker}"
 
+    phase2b_markers = (
+        'WAN2GP_MMGP_EXPERIMENT_THREADED_PREFETCH',
+        'def start_threaded_prefetch(',
+        'def consume_threaded_prefetch(',
+        '[MMGP experiment] Phase 2B threaded next-block prefetch enabled',
+        '"prefetch_records": _json_safe(prefetches)',
+    )
+    for marker in phase2b_markers:
+        assert marker in profiler, f"missing Phase 2B marker: {marker}"
+
     # The experimental integration must keep the upstream MMGP pin intact.
     requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
     assert "mmgp==3.8.1" in requirements
 
-    print("MMGP Phase 1 static checks passed.")
+    print("MMGP Phase 1/2B static checks passed.")
 
 
 if __name__ == "__main__":
