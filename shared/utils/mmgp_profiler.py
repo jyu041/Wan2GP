@@ -439,7 +439,9 @@ class _RuntimeProfiler:
                 return
             self._resolve_cuda_events()
             unresolved = sum(1 for r in self.pending_cuda if r.get("generation_id") == generation_id)
-            if generation_id in self._exported_sessions and not force and unresolved:
+            if generation_id in self._exported_sessions and not force:
+                return
+            if unresolved and not force:
                 return
             blocks = self._records_for(self.block_records, generation_id)
             loads = self._records_for(self.load_records, generation_id)
