@@ -176,6 +176,7 @@ class _RuntimeProfiler:
         return {
             "async_transfers": bool(getattr(manager, "async_transfers", False)),
             "experimental_threaded_prefetch": bool(self.prefetch_enabled),
+            "experimental_prefetch_stream_lifetime_tracking": bool(self.prefetch_enabled),
             "device_mem_capacity": int(getattr(manager, "device_mem_capacity", 0) or 0),
             "models": models,
         }
@@ -222,6 +223,66 @@ class _RuntimeProfiler:
                     loras_modules[parent_module] = lora_data
         if loras_modules:
             manager._move_loras(loras_active_adapters, loras_modules, False, model)
+
+    def _record_cuda_value_on_stream(self, value, stream, seen: set[int]) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, dict):
+            return sum(self._record_cuda_value_on_stream(v, stream, seen) for v in value.values())
+        if isinstance(value, (list, tuple)):
+            return sum(self._record_cuda_value_on_stream(v, stream, seen) for v in value)
+
+        candidates = []
+        try:
+            candidates = self.offload_module._get_quantized_subtensors(value) or []
+        except Exception:
+            candidates = []
+        tensors = [tensor for _, tensor in candidates] if candidates else [value]
+
+        recorded = 0
+        for tensor in tensors:
+            if not torch.is_tensor(tensor) or not tensor.is_cuda:
+                continue
+            try:
+                ref = int(tensor.data_ptr())
+            except Exception:
+                ref = id(tensor)
+            if ref in seen:
+                continue
+            tensor.record_stream(stream)
+            seen.add(ref)
+            recorded += 1
+        return recorded
+
+    def _record_prefetched_block_on_current_stream(self, manager, model_id: str, blocks_name: str, stream) -> int:
+        entry_name = self._block_entry(model_id, blocks_name)
+        blocks_params = (getattr(manager, "blocks_of_modules", {}) or {}).get(entry_name) or ()
+        seen: set[int] = set()
+        recorded = 0
+        parent_modules = []
+        parent_ids = set()
+
+        for parent_module, name, _, _, _ in blocks_params:
+            value = getattr(parent_module, name, None)
+            recorded += self._record_cuda_value_on_stream(value, stream, seen)
+            ident = id(parent_module)
+            if ident not in parent_ids:
+                parent_ids.add(ident)
+                parent_modules.append(parent_module)
+
+        model = manager.models[model_id]
+        active_adapters = getattr(model, "_loras_active_adapters", None) or ()
+        loras_model_data = getattr(model, "_loras_model_data", None)
+        if loras_model_data is not None and active_adapters:
+            for parent_module in parent_modules:
+                lora_data = loras_model_data.get(parent_module, None)
+                if lora_data is None:
+                    continue
+                for adapter in active_adapters:
+                    recorded += self._record_cuda_value_on_stream(
+                        lora_data.get(adapter + "_GPU", None), stream, seen
+                    )
+        return recorded
 
     def _threaded_prefetch_worker(self, state, manager, model_id: str, blocks_name: str) -> None:
         started_ns = time.perf_counter_ns()
@@ -344,7 +405,11 @@ class _RuntimeProfiler:
             if manager.ready_to_check_mem():
                 manager.empty_cache_if_needed()
 
-        torch.cuda.current_stream().wait_event(ready_event)
+        current_stream = torch.cuda.current_stream()
+        current_stream.wait_event(ready_event)
+        recorded_tensors = self._record_prefetched_block_on_current_stream(
+            manager, model_key, blocks_name, current_stream
+        )
         manager.loaded_blocks[model_id] = blocks_name
         consumed_ns = time.perf_counter_ns()
         record = {
@@ -360,6 +425,7 @@ class _RuntimeProfiler:
             "adopt_wall_ms": (consumed_ns - wait_started_ns) / 1_000_000.0,
             "memory_before": state.get("memory_before"),
             "memory_after_prepare": state.get("memory_after_prepare"),
+            "record_stream_tensors": recorded_tensors,
             "memory_after_adopt": self._memory_sample(),
         }
         with self.lock:
