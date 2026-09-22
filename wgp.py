@@ -8052,6 +8052,7 @@ def generate_media(
                     repeat_no=repeat_no,
                     fps=fps,
                 )
+                _mmgp_profile_callback = mmgp_profiler.wrap_callback(_mmgp_profile_token, callback)
                 samples = wan_model.generate(
                     input_prompt = prompt,
                     alt_prompt = current_alt_prompt,
@@ -8090,7 +8091,7 @@ def generate_media(
                     embedded_guidance_scale=embedded_guidance_scale,
                     n_prompt=negative_prompt,
                     seed=seed,
-                    callback=callback,
+                    callback=_mmgp_profile_callback,
                     enable_RIFLEx = enable_RIFLEx,
                     VAE_tile_size = VAE_tile_size,
                     joint_pass = joint_pass,
